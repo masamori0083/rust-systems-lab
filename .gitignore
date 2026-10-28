@@ -1,0 +1,10 @@
+# Build outputs and local files
+**/target/
+.DS_Store
+/.local/
+
+# Personal learning context and cloud connection details
+/AGENTS.md
+/Linux_Systems_English_Interview_Plan_v1.md
+/docs/azure-environment.md
+/docs/learning-progress.md
