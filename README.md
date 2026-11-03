@@ -9,7 +9,7 @@ design choices, and failure cases.
 | Project | What it does | Current status |
 | --- | --- | --- |
 | [linux-job-agent](linux-job-agent/) | Runs a command as a child process, waits for it to finish, and forwards its exit code | Minimal CLI verified on macOS and Ubuntu Arm64 |
-| [tcp-proxy](tcp-proxy/) | Accepts one TCP connection and echoes received bytes using a reusable buffer | Echo exercise verified on macOS arm64; upstream forwarding is the next step |
+| [tcp-proxy](tcp-proxy/) | Forwards bytes in both directions between a client and a fixed destination, using blocking I/O and two threads | HTTP forwarding and an EOF-triggered response verified on Ubuntu Arm64 |
 
 Both projects are independent Cargo packages. Run Cargo commands inside the
 project directory or specify its manifest path.
@@ -38,37 +38,49 @@ hello world
 For more examples, exit-code behavior, and current limitations, see the
 [job agent README](linux-job-agent/README.md).
 
-## Try the TCP echo exercise
+## Try the TCP proxy
 
-In one terminal on the same machine:
+The current destination is an experimental Rust server on port 8001. It waits
+for request EOF before returning a fixed response. Run all three terminals on
+the same machine; each `127.0.0.1` address refers to that machine.
+
+Terminal 1, from the repository root:
 
 ```bash
 cd tcp-proxy
-cargo run
+cargo run --example eof_backend -j1
 ```
 
-In another terminal:
+Terminal 2, also from the repository root:
 
 ```bash
-printf 'hello\n' | nc 127.0.0.1 9000
+cd tcp-proxy
+cargo run --bin tcp-proxy -j1
 ```
 
-The client receives `hello` followed by a newline. The server handles one
-connection and exits after EOF or an I/O error. Restart it for another run.
-See the [TCP experiment README](tcp-proxy/README.md) for the 2000-byte check,
-platform verification, and current limitations.
+In terminal 3, run the send-side shutdown client from the
+[TCP proxy README](tcp-proxy/README.md#send-a-request). It sends `hello\n`,
+closes only its sending direction, and reads the response until EOF.
+
+Expected response: `b'EOF received\n'`. Both Rust programs handle one connection
+per run and must be restarted for another request. The current backend is a raw
+TCP test server, so ordinary HTTP requests with `curl` are not this demo's client.
 
 ## Design notes
 
 - [Forwarding child-process exit codes](docs/decisions/001-exit-code.md)
   (Japanese): alternatives, observed results, and current limitations.
+- [Blocking I/O with one thread per direction](docs/decisions/002-bidirectional-io.md)
+  (Japanese): the selected design, handle ownership, and remaining limitations.
 
 ## Experiment notes
 
 - [Process creation, waiting, and exit](docs/experiments/001-process-lifecycle.md)
   (Japanese): Linux observations using ps, /proc, and strace.
 - [The limit of a single TCP read](docs/experiments/002-tcp-single-read.md)
-  (Japanese): prediction, reproduction, design choice, and before/after results.
+  (Japanese): the earlier echo exercise, prediction, and before/after results.
+- [Forwarding EOF without losing the response](docs/experiments/003-tcp-half-close.md)
+  (Japanese): the EOF-waiting backend, reproduction steps, and observed results.
 
 ## Verification
 
@@ -78,15 +90,19 @@ From the repository root:
 cargo fmt --manifest-path linux-job-agent/Cargo.toml -- --check
 cargo test --manifest-path linux-job-agent/Cargo.toml --locked
 cargo fmt --manifest-path tcp-proxy/Cargo.toml -- --check
+cargo build --manifest-path tcp-proxy/Cargo.toml --all-targets --locked -j1
 cargo test --manifest-path tcp-proxy/Cargo.toml --locked
 ```
 
 No Rust unit tests are defined yet. The command runner has been manually checked
 with successful commands, nonzero exit codes (1 and 7), and a missing executable.
 The commands and expected results are documented in the project README.
-The TCP experiment has been manually checked with a short message and a
-2000-byte payload. The experiment notes distinguish learner runs from AI
-support and record what has not been verified.
+The current TCP proxy has been manually checked on Ubuntu with an HTTP response
+(using the earlier destination setting, port 8000) and with a six-byte request
+followed by a send-side shutdown (using the current port 8001). The experiment
+notes distinguish learner runs from AI support and record untested conditions.
+The earlier 2000-byte echo check is historical evidence, not a test of the current
+proxy's payload integrity. Two unused-item warnings remain in the proxy.
 
 This repository contains learning experiments. Features such as timeouts,
 cancellation, and resource limits are not implemented in the current job agent.

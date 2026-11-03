@@ -1,79 +1,141 @@
 # tcp-proxy
 
-A Rust learning experiment that will grow into a TCP proxy. The current version
-is a TCP echo server: it accepts one connection, reads bytes into a reusable
-1024-byte buffer, and writes the bytes back to the same client.
+A small Rust TCP proxy that forwards bytes in both directions for one client
+connection. It uses blocking I/O, an additional request thread, and the main
+thread for responses.
+
+The current destination is `127.0.0.1:8001`. The included
+[EOF-waiting backend](examples/eof_backend.rs) is an experimental Rust server
+that sends `EOF received\n` only after it receives EOF from the proxy.
+
+```text
+test client <-> proxy :9000 <-> EOF-waiting backend :8001
+```
 
 ## Requirements and verification
 
-- Rust and Cargo; checked with version 1.96.0 on macOS arm64.
-- `nc` for the manual client commands below.
-- This project has not yet been built or run on Linux.
+- Rust and Cargo; checked with version 1.96.0.
+- Python 3 for the short test client below; no extra Python packages are needed.
+- Run all processes on the same host. When using a Linux VM, run the client in
+  that VM too, since `127.0.0.1` is local to each host.
+- The learner verified HTTP forwarding and the EOF-triggered response on
+  Ubuntu 24.04.5 LTS / aarch64. The earlier HTTP check used a destination on
+  port 8000; the committed code now targets port 8001.
+- AI separately verified the backend on macOS arm64 with empty, six-byte, and
+  2000-byte inputs. That backend-only check is separate from proxy verification.
+- Before publishing this checkpoint, AI also ran the README client through the
+  current proxy on macOS arm64: the six-byte request produced the expected
+  response and EOF, and both Rust programs exited with code 0.
 
-## Run
+## Start the backend and proxy
 
-From this directory, in terminal 1:
-
-```bash
-cargo run
-```
-
-The server listens on `127.0.0.1:9000` and waits for one connection. No startup
-message is printed. The current code may emit an unused-variable warning for
-`peer_addr`; the address is not used in the echo exercise.
-
-In terminal 2 on the same machine:
-
-```bash
-printf 'hello\n' | nc 127.0.0.1 9000
-```
-
-The client receives `hello` and a newline. The server stops reading when it sees
-EOF or an I/O error, then closes the connection as the stream leaves scope.
-Restart the server before each example: it accepts only one connection per run.
-
-## Check a payload larger than the buffer
-
-Restart the server in terminal 1, then run in terminal 2:
+In terminal 1, from this package directory:
 
 ```bash
-head -c 2000 /dev/zero | nc 127.0.0.1 9000 | wc -c
+cargo run --example eof_backend -j1
 ```
 
-The learner observed 1024 returned bytes with a single `read`, then 2000 returned
-bytes after adding a read/write loop. The loop reuses the same array and writes
-only the bytes read, using `write_all(&buffer[..n])`.
+Wait for `待ち受け中: 127.0.0.1:8001`.
 
-The per-call read size is not guaranteed. The 2000-byte count check measures
-returned length; it does not compare the payload contents or order. See the
-[experiment record](../docs/experiments/002-tcp-single-read.md) for evidence,
-design reasoning, and limits of the measurement.
+In terminal 2, from the same package directory:
+
+```bash
+cargo run --bin tcp-proxy -j1
+```
+
+The proxy listens on `127.0.0.1:9000`. It prints no startup message while waiting
+for its client. Its destination stream is printed after the client connects.
+
+Both programs accept only one connection. Restart both before repeating the
+demo. A connection probe such as `nc -vz` also consumes that one connection.
+
+## Send a request
+
+In terminal 3 on the same host:
+
+```bash
+python3 - <<'PY'
+import socket
+
+with socket.create_connection(("127.0.0.1", 9000), timeout=5) as client:
+    client.sendall(b"hello\n")
+    # Finish sending while keeping the receiving direction open.
+    client.shutdown(socket.SHUT_WR)
+
+    response = b""
+    while True:
+        data = client.recv(1024)
+        if not data:
+            break
+        response += data
+
+    print(f"response: {response!r}")
+PY
+```
+
+Expected output:
+
+```text
+response: b'EOF received\n'
+```
+
+The backend logs six received bytes, then EOF, then the response write. The
+client finishes after receiving EOF, and the proxy returns to its prompt after
+joining its request thread. The backend also exits.
+
+This backend uses a raw TCP exchange rather than HTTP. An ordinary `curl`
+request does not close its sending direction after its HTTP headers, so it
+cannot trigger this backend's EOF-based response.
+
+## How forwarding and EOF work
+
+| Execution context | Reads from | Writes to |
+| --- | --- | --- |
+| Additional thread | `stream` (client) | `upstream` (destination) |
+| Main thread | `upstream_reader` (destination) | `client_writer` (client) |
+
+`try_clone()` creates another owned handle to the same TCP connection; it does
+not establish another connection. The original handles move into the request
+thread, and the cloned handles remain in the main thread.
+
+Each direction reuses a 1024-byte application buffer. A successful read can
+return fewer bytes than its capacity. `write_all(&buffer[..n])` writes the bytes
+that were read. The two arrays do not represent total process or kernel memory.
+
+On EOF, each direction calls `shutdown(Shutdown::Write)` on its destination:
+client EOF finishes sending to the backend, and backend EOF finishes sending
+to the client. This preserves the opposite direction for any remaining data.
+The main thread calls `join()` after its response loop.
 
 ## Checks
 
 ```bash
 cargo fmt -- --check
-cargo build --locked
-cargo test --locked
+cargo build --all-targets --locked -j1
+cargo test --locked -j1
 ```
 
-No Rust unit tests or CI workflow have been added. Runtime I/O error branches
-exist but have not been verified by fault injection.
+No Rust unit tests or CI workflow have been added. `cargo test` currently runs
+zero tests. The main binary has two warnings for the unused `std::error` import
+and `peer_addr` binding. They are retained in this learning checkpoint.
 
-Before publishing this checkpoint, AI-assisted verification on macOS also
-compared the echoed contents for a 6-byte message and a 2000-byte binary payload,
-and checked that empty input followed by a send-side shutdown ended the server.
-All three checks passed. The temporary client was outside the repository; these
-checks are recorded in the experiment notes and are not a committed test suite.
+For the learner's observations, AI support, and limits of the evidence, see the
+[half-close experiment](../docs/experiments/003-tcp-half-close.md). The earlier
+[echo experiment](../docs/experiments/002-tcp-single-read.md) describes a previous
+implementation, not the current forwarding behavior.
 
-## Current scope
+## Current limitations
 
-- One blocking TCP connection per run, bound to the local machine.
-- One 1024-byte application buffer, reused across reads.
-- EOF ends the read loop; read/write errors are printed and end the loop.
-- Operational errors are printed to stdout; the program does not set a nonzero
-  exit status for those errors.
-- No upstream connection, HTTP processing, timeout, or concurrent clients yet.
-
-The next step is to connect to a test HTTP server and forward bytes between two
-TCP connections.
+- One client connection per run, fixed addresses, and no reconnect or retry.
+- No HTTP parsing, TLS termination, or message framing.
+- No timeout or coordinated cancellation. An I/O error in one direction can
+  leave the other blocked in `read`, `write_all`, or `join`.
+- A peer that never finishes sending can keep the program waiting indefinitely.
+  The demo client's five-second timeout is not a proxy timeout.
+- I/O errors are printed; they are not propagated out of the worker. A
+  successful `join()` means no thread panic, not successful data transfer.
+- Operational errors are printed to stdout and do not set a nonzero exit code.
+- Reset connections, stalled peers, and thread-start failures have not been
+  tested. The comparison with EOF forwarding disabled is still pending.
+- Current checks do not establish throughput, total memory use, or arbitrary
+  payload integrity through the proxy. The test backend discards request bytes.
